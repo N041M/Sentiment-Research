@@ -1,6 +1,6 @@
 # Sentiment Reseach
 
-**A three-channel NLP + time-series research system that captures influential statements, public reactions, and market ground truth — and measures how they relate.**
+**A three-channel NLP + time-series research system that captures influential statements, public reactions, and market ground truth and measures how they relate.**
 
 Built as the empirical platform for a master's thesis in financial NLP. The research questions:
 
