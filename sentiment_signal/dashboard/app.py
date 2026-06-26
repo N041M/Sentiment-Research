@@ -9,7 +9,6 @@ from sqlalchemy import func, select
 from sentiment_signal.db.models import (
     ContextPeriod,
     Event,
-    EventContext,
     Person,
     SentimentSignalRecord,
     Statement,
@@ -17,6 +16,7 @@ from sentiment_signal.db.models import (
 )
 from sentiment_signal.db.session import SessionLocal
 from sentiment_signal.features.geography import country_for_institution
+from sentiment_signal.features.market_response import statement_market_pairs
 
 st.set_page_config(page_title="Sentiment Signal", layout="wide")
 st.title("Sentiment Signal — Research Dashboard")
@@ -28,13 +28,6 @@ session = SessionLocal()
 # (e.g. cluster_speeches), and Postgres queues all readers behind the ALTER —
 # hanging the whole dashboard.
 session.connection(execution_options={"isolation_level": "AUTOCOMMIT"})
-
-MARKET_GROUP_LABELS = {
-    "equity_us": "US Equity",
-    "equity_eu": "European Equity",
-    "equity_ap": "Asia-Pacific Equity",
-    "fx_major": "Major FX",
-}
 
 # Band colours for macro-context regimes, by category (used to shade time charts)
 CONTEXT_CATEGORY_COLORS = {
@@ -147,10 +140,12 @@ _m[5].metric(
     "Equity: ≥±1%. FX: ≥±0.5%.",
 )
 _m[6].metric(
-    "Event contexts",
-    session.scalar(select(func.count()).select_from(EventContext)),
-    help="Market events that had at least one tracked speech in the 48-hour lookback window. "
-    "Each row links an event to the pre-event sentiment signal.",
+    "In-domain speeches",
+    session.scalar(
+        select(func.count()).select_from(Statement).where(Statement.source_type == "speech")
+    ),
+    help="Central-bank speeches (source_type='speech') — the in-domain population paired with "
+    "their mandated market in the Phase 1 Results tab. Ceremonial/other docs are excluded.",
 )
 
 st.divider()
@@ -171,167 +166,134 @@ tab_results, tab_clusters, tab_sentiment, tab_context, tab_speeches, tab_adhoc =
 # TAB 1 — Phase 1 scatter chart
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_results:
-    st.subheader("Pre-event Signal vs Subsequent Market Move")
+    st.subheader("Statement Signal vs Subsequent Market Move")
     st.caption(
-        "Each point is one market event (a daily price move above the detection threshold). "
-        "**X-axis:** mean statement sentiment in the 48 h before the event — "
-        "positive = optimistic/hawkish speeches preceded the event, negative = pessimistic/dovish. "
-        "**Y-axis:** the market move that followed, in percent (positive = market rose, negative = fell). "
-        "The blue OLS line is the best-fit linear trend across all points."
+        "Each point is **one in-domain speech**, paired with the **next trading-day move** "
+        "of the single market its speaker plausibly affects (Fed→S&P 500, ECB→Euro Stoxx, "
+        "BoJ→Nikkei, RBA→ASX, …). **X-axis:** the speech's sentiment (−1 negative … +1 "
+        "positive). **Y-axis:** that market's return on the first session *strictly after* "
+        "the speech (%). This is relevance-aware and point-in-time — one row per speech, no "
+        "look-ahead — replacing the retired geography-blind 48 h window attribution. Daily "
+        "data, so a day's move is a noisy proxy for one speech: read as **exploratory**."
     )
 
-    available_groups = (
-        session.execute(select(Event.notes).distinct().where(Event.notes.isnot(None)))
-        .scalars()
-        .all()
-    )
-    group_options = ["All"] + sorted(MARKET_GROUP_LABELS.get(g, g) for g in available_groups if g)
-    selected_group = st.selectbox(
-        "Filter by market group",
-        group_options,
-        key="results_group",
-        help="Restrict the chart to one market group. See the Glossary for which symbols each group contains.",
-    )
+    df_pairs = statement_market_pairs(session)
 
-    ctx_query = (
-        select(
-            EventContext.mean_signal_in_window,
-            EventContext.dominant_person,
-            Event.magnitude_pct,
-            Event.direction,
-            Event.timestamp,
-            Event.domain,
-            Event.notes.label("market_group"),
+    if df_pairs.empty:
+        st.info(
+            "No relevance-aware pairs yet. Needs scored speeches (steps 3,4) and price data "
+            "(step 5) for the mapped indices."
         )
-        .join(Event, EventContext.event_id == Event.id)
-        .where(EventContext.mean_signal_in_window.isnot(None))
-        .where(Event.magnitude_pct.isnot(None))
-    )
-    if selected_group != "All":
-        raw_group = next(
-            (k for k, v in MARKET_GROUP_LABELS.items() if v == selected_group), selected_group
-        )
-        ctx_query = ctx_query.where(Event.notes == raw_group)
-
-    ctx_rows = session.execute(ctx_query).all()
-
-    if ctx_rows:
-        df_ctx = pd.DataFrame(
-            ctx_rows,
-            columns=[
-                "signal",
-                "dominant_speaker",
-                "magnitude_pct",
-                "direction",
-                "timestamp",
-                "market_symbol",
-                "market_group",
-            ],
-        )
-        df_ctx["magnitude_pct"] = df_ctx["magnitude_pct"].astype(float)
-        df_ctx["signal"] = df_ctx["signal"].astype(float)
-        df_ctx["abs_magnitude_pct"] = df_ctx["magnitude_pct"].abs()
-        df_ctx["direction_label"] = df_ctx["direction"].map({1: "Up", -1: "Down", 0: "Flat"})
-        df_ctx["market_label"] = (
-            df_ctx["market_group"].map(MARKET_GROUP_LABELS).fillna(df_ctx["market_group"])
-        )
-        df_ctx["timestamp"] = pd.to_datetime(df_ctx["timestamp"], utc=True)
-
-        r_pearson, p_pearson = stats.pearsonr(df_ctx["signal"], df_ctx["magnitude_pct"])
-        r_abs, p_abs = stats.pearsonr(df_ctx["signal"], df_ctx["abs_magnitude_pct"])
-        r_spearman, p_spear = stats.spearmanr(df_ctx["signal"], df_ctx["magnitude_pct"])
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric(
-            "N (event–context pairs)",
-            len(df_ctx),
-            help="Number of market events that had at least one tracked speech in the 48 h before them.",
-        )
-        c2.metric(
-            "Pearson r — directional",
-            f"{r_pearson:.3f}",
-            help=f"Linear correlation between pre-event sentiment and the signed market move "
-            f"(positive = market rose, negative = fell). "
-            f"Range −1 to +1. p = {p_pearson:.4f}",
-        )
-        c3.metric(
-            "Pearson r — magnitude",
-            f"{r_abs:.3f}",
-            help=f"Linear correlation between pre-event sentiment and the absolute size of the move, "
-            f"ignoring direction. Range −1 to +1. p = {p_abs:.4f}",
-        )
-        c4.metric(
-            "Spearman r",
-            f"{r_spearman:.3f}",
-            help=f"Rank-order correlation between pre-event sentiment and directional move. "
-            f"More robust to outliers than Pearson r. Range −1 to +1. p = {p_spear:.4f}",
-        )
-
-        for lbl, p in [("Directional Pearson", p_pearson), ("Magnitude Pearson", p_abs)]:
-            sig = "significant (p < 0.05)" if p < 0.05 else "not significant (p >= 0.05)"
-            st.caption(f"{lbl}: {sig} — p = {p:.4f}")
-
-        color_col = "market_label" if selected_group == "All" else "direction_label"
-        color_map = (
-            {"Up": "#16a34a", "Down": "#dc2626", "Flat": "#6b7280"}
-            if color_col == "direction_label"
-            else {}
-        )
-        fig = px.scatter(
-            df_ctx,
-            x="signal",
-            y="magnitude_pct",
-            color=color_col,
-            color_discrete_map=color_map or None,
-            hover_data={
-                "timestamp": True,
-                "dominant_speaker": True,
-                "market_symbol": True,
-                "abs_magnitude_pct": ":.2f",
-            },
-            labels={
-                "signal": "Pre-event sentiment signal  (negative = dovish/pessimistic, positive = hawkish/optimistic)",
-                "magnitude_pct": "Market move following the event (%)",
-                "market_label": "Market group",
-                "direction_label": "Market direction",
-                "dominant_speaker": "Most-cited speaker",
-                "market_symbol": "Market symbol",
-                "abs_magnitude_pct": "Absolute move (%)",
-            },
-            trendline="ols",
-            trendline_scope="overall",
-            trendline_color_override="#1d4ed8",
-            height=520,
-        )
-        fig.update_traces(marker=dict(size=7, opacity=0.7))
-        fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.4)
-        fig.add_vline(x=0, line_dash="dot", line_color="gray", opacity=0.4)
-        st.plotly_chart(fig, width="stretch")
-
-        if selected_group == "All" and not df_ctx["market_label"].isna().all():
-            st.subheader("Results by Market Group")
-            st.caption(
-                "Pearson r and p-value computed separately for each market group. "
-                "Groups with fewer than 3 event–context pairs are excluded."
-            )
-            breakdown = []
-            for grp, gdf in df_ctx.groupby("market_label"):
-                if len(gdf) < 3:
-                    continue
-                rp, pp = stats.pearsonr(gdf["signal"], gdf["magnitude_pct"])
-                breakdown.append(
-                    {
-                        "Market group": grp,
-                        "Events (N)": len(gdf),
-                        "Pearson r": round(rp, 3),
-                        "p-value": round(pp, 4),
-                        "Significant (p < 0.05)": "yes" if pp < 0.05 else "no",
-                    }
-                )
-            if breakdown:
-                st.dataframe(pd.DataFrame(breakdown), hide_index=True, width="stretch")
     else:
-        st.info("Run: python scripts/run_phase1.py --steps 8,9")
+        df_pairs = df_pairs.dropna(subset=["ret_pct", "sentiment_score"]).copy()
+        fcol1, fcol2, fcol3 = st.columns([2, 2, 2])
+        with fcol1:
+            market_opts = ["All"] + sorted(df_pairs["market"].unique())
+            sel_market = st.selectbox(
+                "Filter by market (speaker's mandated index)",
+                market_opts,
+                key="results_market",
+                help="Each speaker is paired only with the index its institution plausibly moves.",
+            )
+        with fcol2:
+            hide_neutral_sent_r = st.checkbox(
+                "Hide neutral sentiment",
+                value=False,
+                key="results_hide_sent",
+                help="Drop points whose FinBERT sentiment label is neutral.",
+            )
+        with fcol3:
+            hide_neutral_stance_r = st.checkbox(
+                "Hide neutral stance",
+                value=False,
+                key="results_hide_stance",
+                help="Drop points whose FOMC-RoBERTa stance is neutral.",
+            )
+        view = df_pairs if sel_market == "All" else df_pairs[df_pairs["market"] == sel_market]
+        if hide_neutral_sent_r:
+            view = view[view["sentiment_label"] != "neutral"]
+        if hide_neutral_stance_r:
+            view = view[view["hawkish_label"] != "neutral"]
+
+        if len(view) < 3:
+            st.info("Too few pairs to correlate for this selection.")
+        else:
+            r_dir, p_dir = stats.pearsonr(view["sentiment_score"], view["ret_pct"])
+            r_spear, p_spear = stats.spearmanr(view["sentiment_score"], view["ret_pct"])
+            n_days = view["date"].nunique()
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "N (speech→market pairs)",
+                len(view),
+                help="One row per in-domain speech mapped to its relevant index (no replication).",
+            )
+            c2.metric(
+                "Distinct market-days",
+                n_days,
+                help="Independent units. N pairs ≫ market-days means clustering inflates naive "
+                "p-values — treat significance cautiously.",
+            )
+            c3.metric(
+                "Pearson r — directional",
+                f"{r_dir:.3f}",
+                help=f"Linear correlation between speech sentiment and the next-day signed move. "
+                f"Range −1 to +1. p = {p_dir:.4f}",
+            )
+            c4.metric(
+                "Spearman r",
+                f"{r_spear:.3f}",
+                help=f"Rank-order correlation, more robust to outliers. p = {p_spear:.4f}",
+            )
+
+            sig = "significant (p < 0.05)" if p_dir < 0.05 else "not significant (p >= 0.05)"
+            st.caption(
+                f"Directional Pearson: {sig} — p = {p_dir:.4f}. "
+                f"Naive p-values assume independence; with {len(view)} pairs over only "
+                f"{n_days} market-days, prefer day-clustered inference (see analyze_habituation.py)."
+            )
+
+            fig = px.scatter(
+                view,
+                x="sentiment_score",
+                y="ret_pct",
+                color="market" if sel_market == "All" else None,
+                hover_data={"timestamp": "|%Y-%m-%d", "person": True, "market": True},
+                labels={
+                    "sentiment_score": "Speech sentiment  (−1 negative … +1 positive)",
+                    "ret_pct": "Next-day move of speaker's market (%)",
+                    "market": "Market",
+                    "person": "Speaker",
+                },
+                trendline="ols",
+                trendline_scope="overall",
+                trendline_color_override="#1d4ed8",
+                height=520,
+            )
+            fig.update_traces(marker=dict(size=7, opacity=0.7))
+            fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.4)
+            fig.add_vline(x=0, line_dash="dot", line_color="gray", opacity=0.4)
+            st.plotly_chart(fig, width="stretch")
+
+            if sel_market == "All":
+                st.subheader("Results by Market")
+                st.caption("Pearson r per mapped index (markets with fewer than 3 pairs excluded).")
+                breakdown = []
+                for grp, gdf in view.groupby("market"):
+                    if len(gdf) < 3:
+                        continue
+                    rp, pp = stats.pearsonr(gdf["sentiment_score"], gdf["ret_pct"])
+                    breakdown.append(
+                        {
+                            "Market": grp,
+                            "Pairs (N)": len(gdf),
+                            "Pearson r": round(rp, 3),
+                            "p-value": round(pp, 4),
+                            "Significant (p < 0.05)": "yes" if pp < 0.05 else "no",
+                        }
+                    )
+                if breakdown:
+                    st.dataframe(pd.DataFrame(breakdown), hide_index=True, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Topic clusters
@@ -488,6 +450,8 @@ with tab_sentiment:
             Statement.source_type,
             Statement.influence_tier,
             StatementAnalysis.topic_classification,
+            StatementAnalysis.sentiment_label,
+            StatementAnalysis.hawkish_label,
         )
         .join(Person, SentimentSignalRecord.person_id == Person.id)
         .join(Statement, SentimentSignalRecord.statement_id == Statement.id)
@@ -514,6 +478,8 @@ with tab_sentiment:
                 "source_type",
                 "influence_tier",
                 "cluster",
+                "sentiment_label",
+                "hawkish_label",
             ],
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -552,6 +518,19 @@ with tab_sentiment:
                 regime_sel = st.selectbox(
                     "Only during regime", ["(any)"] + [p.name for p in context_periods]
                 )
+                hide_neutral_sent_t = st.checkbox(
+                    "Hide neutral sentiment",
+                    value=False,
+                    key="time_hide_sent",
+                    help="Drop speeches whose FinBERT sentiment label is neutral.",
+                )
+                hide_neutral_stance_t = st.checkbox(
+                    "Hide neutral stance",
+                    value=False,
+                    key="time_hide_stance",
+                    help="Drop speeches whose FOMC-RoBERTa stance is neutral. "
+                    "Non-monetary documents (no stance) stay visible.",
+                )
 
         mask = (
             df["country"].isin(sel_countries)
@@ -561,6 +540,10 @@ with tab_sentiment:
             & df["timestamp"].dt.year.between(yr_sel[0], yr_sel[1])
             & df["statement_sentiment"].between(sent_sel[0], sent_sel[1])
         )
+        if hide_neutral_sent_t:
+            mask &= df["sentiment_label"] != "neutral"
+        if hide_neutral_stance_t:
+            mask &= df["hawkish_label"] != "neutral"
         if regime_sel != "(any)":
             rp = next((p for p in context_periods if p.name == regime_sel), None)
             if rp is not None:
@@ -861,6 +844,22 @@ with tab_speeches:
     with col3:
         search_text = st.text_input("Search text", placeholder="e.g. inflation, rate hike")
 
+    # Two independent toggles — hide neutral by sentiment and/or by stance, separately.
+    tcol1, tcol2, _tcol3 = st.columns([2, 2, 2])
+    with tcol1:
+        hide_neutral_sentiment = st.checkbox(
+            "Hide neutral sentiment",
+            value=False,
+            help="Drop speeches whose FinBERT sentiment label is neutral.",
+        )
+    with tcol2:
+        hide_neutral_stance = st.checkbox(
+            "Hide neutral stance",
+            value=False,
+            help="Drop speeches whose FOMC-RoBERTa hawkish/dovish stance is neutral. "
+            "Non-monetary documents (which have no stance) stay visible.",
+        )
+
     speech_query = (
         select(
             Statement.id,
@@ -870,6 +869,8 @@ with tab_speeches:
             Person.canonical_name.label("person"),
             StatementAnalysis.sentiment_score,
             StatementAnalysis.sentiment_label,
+            StatementAnalysis.hawkish_score,
+            StatementAnalysis.hawkish_label,
             StatementAnalysis.topic_classification,
             Statement.raw_text,
         )
@@ -885,6 +886,16 @@ with tab_speeches:
             speech_query = speech_query.where(Statement.person_id == person_obj.id)
     if search_text.strip():
         speech_query = speech_query.where(Statement.raw_text.ilike(f"%{search_text.strip()}%"))
+    # Independent neutral filters. is_distinct_from keeps NULL-stance (non-monetary)
+    # rows visible when hiding neutral stance — `!= 'neutral'` would drop them.
+    if hide_neutral_sentiment:
+        speech_query = speech_query.where(
+            StatementAnalysis.sentiment_label.is_distinct_from("neutral")
+        )
+    if hide_neutral_stance:
+        speech_query = speech_query.where(
+            StatementAnalysis.hawkish_label.is_distinct_from("neutral")
+        )
 
     speech_rows = session.execute(speech_query.limit(200)).all()
     st.caption(f"{len(speech_rows)} speeches shown (max 200)")
@@ -900,12 +911,15 @@ with tab_speeches:
                 "person",
                 "sentiment_score",
                 "sentiment_label",
+                "hawkish_score",
+                "hawkish_label",
                 "topic_cluster",
                 "raw_text",
             ],
         )
         df_sp["date"] = pd.to_datetime(df_sp["date"], utc=True).dt.date
         df_sp["sentiment_score"] = df_sp["sentiment_score"].round(3)
+        df_sp["hawkish_score"] = df_sp["hawkish_score"].round(3)
         df_sp["preview"] = df_sp["raw_text"].str[:200] + "…"
 
         st.dataframe(
@@ -915,6 +929,8 @@ with tab_speeches:
                     "person",
                     "sentiment_score",
                     "sentiment_label",
+                    "hawkish_score",
+                    "hawkish_label",
                     "topic_cluster",
                     "preview",
                     "url",
@@ -931,6 +947,16 @@ with tab_speeches:
                 "sentiment_label": st.column_config.TextColumn(
                     "Sentiment label",
                     help="Categorical class assigned by FinBERT: positive, neutral, or negative.",
+                ),
+                "hawkish_score": st.column_config.NumberColumn(
+                    "Hawkish score",
+                    format="%.3f",
+                    help="FOMC-RoBERTa monetary-policy stance: +1 = hawkish, −1 = dovish, 0 = neutral. "
+                    "Central-bank speeches only; blank for non-monetary documents.",
+                ),
+                "hawkish_label": st.column_config.TextColumn(
+                    "Stance",
+                    help="FOMC-RoBERTa stance class: hawkish, neutral, or dovish (central-bank speeches only).",
                 ),
                 "topic_cluster": st.column_config.TextColumn(
                     "Topic cluster",

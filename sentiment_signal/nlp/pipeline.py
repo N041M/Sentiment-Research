@@ -20,9 +20,33 @@ FINBERT_CHUNKED_VERSION = "ProsusAI/finbert+chunk-meanpool-v1"
 _MAX_TOKENS = 512
 _CHUNK_TOKENS = _MAX_TOKENS - 2
 
-# FOMC-RoBERTa label mapping: HAWKISH=restrictive, DOVISH=accommodative
-# hawkish_score = P(HAWKISH) - P(DOVISH)  →  >0 hawkish, <0 dovish
-_FOMC_LABEL_MAP = {0: "hawkish", 1: "dovish", 2: "neutral"}
+# FOMC-RoBERTa label mapping. The published model ships a generic
+# id2label={0:LABEL_0, 1:LABEL_1, 2:LABEL_2}: the semantics live ONLY in the model
+# card, which documents label_0=dovish, label_1=hawkish, label_2=neutral
+# (gtfintechlab/FOMC-RoBERTa; Shah, Paturi & Chava, ACL 2023; verified against the
+# published config.json, June 2026). Getting this order wrong silently INVERTS the
+# entire stance signal, so resolve indices via resolve_hawk_dove_indices rather than
+# trusting a positional assumption. hawkish_score = P(hawkish) - P(dovish).
+_FOMC_DOVE_IDX = 0
+_FOMC_HAWK_IDX = 1
+_FOMC_NEUTRAL_IDX = 2
+
+
+def resolve_hawk_dove_indices(id2label: dict) -> tuple[int, int]:
+    """Return (hawk_idx, dove_idx) for a hawkish/dovish classifier's output.
+
+    Prefers descriptive class names in the model config (`hawkish`/`dovish`); falls
+    back to the documented gtfintechlab/FOMC-RoBERTa order (label_0=dovish,
+    label_1=hawkish) when the config carries only generic LABEL_N names — as the
+    published one does. This keeps the sign correct regardless of how the loaded
+    model happens to name its classes.
+    """
+    lower = {int(k): str(v).lower() for k, v in id2label.items()}
+    hawk = next((k for k, v in lower.items() if "hawk" in v), None)
+    dove = next((k for k, v in lower.items() if "dov" in v), None)
+    if hawk is not None and dove is not None:
+        return hawk, dove
+    return _FOMC_HAWK_IDX, _FOMC_DOVE_IDX
 
 
 def _best_device() -> str:
@@ -106,11 +130,16 @@ class NLPPipeline:
                 )
         return results
 
-    def _chunk_text(self, text: str) -> list[tuple[str, int]]:
-        """Split text into (chunk_text, token_count) windows of ≤ _CHUNK_TOKENS tokens."""
-        ids = self.tokenizer.encode(text or "", add_special_tokens=False)
+    def _chunk_text(self, text: str, tokenizer=None) -> list[tuple[str, int]]:
+        """Split text into (chunk_text, token_count) windows of ≤ _CHUNK_TOKENS tokens.
+
+        Chunks with `tokenizer` (defaults to the main model's). The FOMC model has a
+        different tokenizer, so its chunk boundaries must be computed with its own.
+        """
+        tok = tokenizer or self.tokenizer
+        ids = tok.encode(text or "", add_special_tokens=False)
         windows = chunk_windows(ids, _CHUNK_TOKENS)
-        return [(self.tokenizer.decode(w, skip_special_tokens=True), len(w)) for w in windows]
+        return [(tok.decode(w, skip_special_tokens=True), len(w)) for w in windows]
 
     def analyze_documents(self, texts: list[str]) -> list[dict]:
         """Score + embed full documents by chunking, then token-weighted aggregation.
@@ -169,44 +198,97 @@ class NLPPipeline:
             embeddings.extend(cls.tolist())
         return embeddings
 
-    def score_hawkish_dovish(self, texts: list[str]) -> list[dict]:
-        """Score texts with FOMC-RoBERTa (hawkish / neutral / dovish).
+    def _ensure_fomc(self) -> None:
+        """Lazily load FOMC-RoBERTa and resolve its hawkish/dovish class indices.
 
-        Returns dicts with hawkish_score ∈ [-1, 1] and hawkish_label.
-        Loads the model lazily on first call.
+        The label order is resolved from the model config (with a documented
+        fallback) and logged once, so a silent sign inversion is impossible to miss.
         """
-        if not hasattr(self, "_fomc_tokenizer"):
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        if hasattr(self, "_fomc_model"):
+            return
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            self._fomc_tokenizer = AutoTokenizer.from_pretrained(FOMC_ROBERTA)
-            fomc_model = AutoModelForSequenceClassification.from_pretrained(FOMC_ROBERTA)
-            if self.use_fp16:
-                fomc_model = fomc_model.half()
-            self._fomc_model = fomc_model.to(self.device)
-            self._fomc_model.eval()
+        self._fomc_tokenizer = AutoTokenizer.from_pretrained(FOMC_ROBERTA)
+        # Chunk manually with an explicit max_length, so silence the length check.
+        self._fomc_tokenizer.model_max_length = int(1e9)
+        fomc_model = AutoModelForSequenceClassification.from_pretrained(FOMC_ROBERTA)
+        if self.use_fp16:
+            fomc_model = fomc_model.half()
+        self._fomc_model = fomc_model.to(self.device)
+        self._fomc_model.eval()
 
-        results: list[dict] = []
+        id2label = self._fomc_model.config.id2label
+        self._fomc_hawk_idx, self._fomc_dove_idx = resolve_hawk_dove_indices(id2label)
+        # Build the label map from the resolved indices (not a positional guess) so the
+        # argmax label always agrees with the sign of hawkish_score.
+        self._fomc_labels = {self._fomc_hawk_idx: "hawkish", self._fomc_dove_idx: "dovish"}
+        for idx in range(len(id2label)):
+            self._fomc_labels.setdefault(idx, "neutral")
+        logger.info(
+            f"FOMC-RoBERTa loaded: id2label={dict(id2label)} resolved "
+            f"hawk_idx={self._fomc_hawk_idx}, dove_idx={self._fomc_dove_idx} "
+            f"(hawkish_score = P[{self._fomc_hawk_idx}] - P[{self._fomc_dove_idx}])"
+        )
+
+    def _fomc_probs(self, texts: list[str]) -> list[list[float]]:
+        """Raw softmax probabilities from FOMC-RoBERTa, one 512-token window per text."""
+        self._ensure_fomc()
+        out: list[list[float]] = []
         for i in range(0, len(texts), settings.nlp_batch_size):
             batch = texts[i : i + settings.nlp_batch_size]
             inputs = self._fomc_tokenizer(
-                batch,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=512,
+                batch, return_tensors="pt", truncation=True, padding=True, max_length=_MAX_TOKENS
             ).to(self.device)
             with torch.no_grad():
                 logits = self._fomc_model(**inputs).logits
-            probs = logits.float().softmax(dim=-1).cpu()
-            for prob_row in probs:
-                # FOMC-RoBERTa: 0=HAWKISH, 1=DOVISH, 2=NEUTRAL
-                p_hawk = float(prob_row[0])
-                p_dove = float(prob_row[1])
-                score = p_hawk - p_dove
-                label = _FOMC_LABEL_MAP[prob_row.argmax().item()]
-                results.append(
-                    {"hawkish_score": score, "hawkish_label": label, "probs": prob_row.tolist()}
-                )
+            out.extend(logits.float().softmax(dim=-1).cpu().tolist())
+        return out
+
+    def _hawkish_from_probs(self, probs) -> tuple[float, str]:
+        """Map a FOMC probability vector to (hawkish_score ∈ [-1, 1], label)."""
+        probs = np.asarray(probs, dtype=float)
+        score = float(probs[self._fomc_hawk_idx] - probs[self._fomc_dove_idx])
+        label = self._fomc_labels[int(probs.argmax())]
+        return score, label
+
+    def score_hawkish_dovish(self, texts: list[str]) -> list[dict]:
+        """Score full documents for hawkish/dovish stance with FOMC-RoBERTa.
+
+        FOMC-RoBERTa truncates at 512 tokens, but central-bank speeches are far
+        longer (median ~19k chars), so a single pass scores only the opening. This
+        chunks each document into 512-token windows, scores every chunk, and
+        token-weighted aggregates the class probabilities into one document result —
+        the same full-document treatment as analyze_documents.
+
+        Returns per-document dicts: hawkish_score ∈ [-1, 1], hawkish_label, probs
+        (aggregated), n_chunks. Loads the model lazily on first call.
+        """
+        self._ensure_fomc()
+        all_chunks: list[str] = []
+        weights: list[int] = []
+        spans: list[tuple[int, int]] = []
+        for text in texts:
+            chunks = self._chunk_text(text, tokenizer=self._fomc_tokenizer) or [("", 1)]
+            start = len(all_chunks)
+            for chunk_text, n_tokens in chunks:
+                all_chunks.append(chunk_text)
+                weights.append(n_tokens)
+            spans.append((start, len(all_chunks)))
+
+        chunk_probs = self._fomc_probs(all_chunks)
+
+        results: list[dict] = []
+        for start, end in spans:
+            agg = weighted_average([chunk_probs[i] for i in range(start, end)], weights[start:end])
+            score, label = self._hawkish_from_probs(agg)
+            results.append(
+                {
+                    "hawkish_score": score,
+                    "hawkish_label": label,
+                    "probs": agg.tolist(),
+                    "n_chunks": end - start,
+                }
+            )
         return results
 
     def agreement_score(self, stmt_embedding: list[float], rxn_embedding: list[float]) -> float:
