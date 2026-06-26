@@ -8,7 +8,13 @@ aggregated back to a single document score/embedding.
 import numpy as np
 import pytest
 
-from sentiment_signal.nlp.pipeline import chunk_windows, weighted_average
+from sentiment_signal.nlp.pipeline import (
+    _FOMC_DOVE_IDX,
+    _FOMC_HAWK_IDX,
+    chunk_windows,
+    resolve_hawk_dove_indices,
+    weighted_average,
+)
 
 
 class TestChunkWindows:
@@ -58,3 +64,29 @@ class TestWeightedAverage:
         # Aggregating probability vectors should still sum to ~1
         out = weighted_average([[0.7, 0.2, 0.1], [0.1, 0.1, 0.8]], [300, 100])
         assert out.sum() == pytest.approx(1.0)
+
+
+class TestResolveHawkDoveIndices:
+    """Guards against silently inverting the hawkish/dovish stance signal."""
+
+    def test_generic_labels_use_documented_fallback(self):
+        # The published gtfintechlab/FOMC-RoBERTa config: label_0=dovish, label_1=hawkish.
+        id2label = {0: "LABEL_0", 1: "LABEL_1", 2: "LABEL_2"}
+        hawk, dove = resolve_hawk_dove_indices(id2label)
+        assert (hawk, dove) == (_FOMC_HAWK_IDX, _FOMC_DOVE_IDX)
+        assert (hawk, dove) == (1, 0)
+
+    def test_descriptive_labels_are_honoured(self):
+        # A differently-ordered model with real names must override the fallback.
+        id2label = {0: "Hawkish", 1: "Neutral", 2: "Dovish"}
+        assert resolve_hawk_dove_indices(id2label) == (0, 2)
+
+    def test_string_keys_are_coerced(self):
+        # HF configs often key id2label with strings.
+        id2label = {"0": "dovish", "1": "hawkish", "2": "neutral"}
+        assert resolve_hawk_dove_indices(id2label) == (1, 0)
+
+    def test_partial_names_fall_back(self):
+        # If either class name is missing, fall back rather than guess.
+        id2label = {0: "hawkish", 1: "LABEL_1", 2: "LABEL_2"}
+        assert resolve_hawk_dove_indices(id2label) == (_FOMC_HAWK_IDX, _FOMC_DOVE_IDX)

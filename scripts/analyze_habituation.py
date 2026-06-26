@@ -25,34 +25,18 @@ import pandas as pd
 import statsmodels.formula.api as smf
 from loguru import logger
 from scipy.stats import spearmanr
-from sqlalchemy import select
 
-from sentiment_signal.db.models import PriceData
 from sentiment_signal.db.session import SessionLocal
 from sentiment_signal.features.geography import primary_market_for_institution
+from sentiment_signal.features.market_response import market_daily_returns
 from sentiment_signal.features.novelty import recent_similar_pressure
 from sentiment_signal.features.sequence import load_event_sequence
 
-VOL_WINDOW = 60  # trading days for the prior-volatility estimate
-
 
 def _market_abnormal(session, symbols: list[str]) -> pd.DataFrame:
-    rows = session.execute(
-        select(PriceData.symbol, PriceData.timestamp, PriceData.close)
-        .where(PriceData.symbol.in_(symbols), PriceData.granularity == "1d")
-        .order_by(PriceData.symbol, PriceData.timestamp)
-    ).all()
-    df = pd.DataFrame(rows, columns=["market", "ts", "close"])
-    df["close"] = df["close"].astype(float)
-    df["date"] = pd.to_datetime(df["ts"], utc=True).dt.tz_localize(None).dt.normalize()
-    parts = []
-    for _, g in df.groupby("market"):
-        g = g.sort_values("date").copy()
-        ret = g["close"].pct_change() * 100
-        prior_std = ret.rolling(VOL_WINDOW).std().shift(1)  # only prior days -> point-in-time
-        g["abnormal"] = ret / prior_std
-        parts.append(g[["market", "date", "abnormal"]])
-    return pd.concat(parts, ignore_index=True).dropna(subset=["abnormal"])
+    """Per-market point-in-time abnormal return (shared with the dashboard pairing)."""
+    df = market_daily_returns(session, symbols)
+    return df[["market", "date", "abnormal"]].dropna(subset=["abnormal"])
 
 
 def _perm_pressure_coef(

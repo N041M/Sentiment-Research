@@ -150,7 +150,10 @@ async def fred_daily_job() -> None:
 
 async def event_detection_job() -> None:
     logger.info("event_detection_job: starting")
-    from scripts.run_phase1 import step8_detect_events, step9_build_event_context
+    # step9 (event_context window-attribution) is retired per architecture_v2 — it is
+    # non-causal/geography-blind (build-log §13.26) and no longer feeds the dashboard,
+    # so we no longer build it on a schedule (stale/invalid pairs were accumulating).
+    # Event *detection* (step8) is independent and still useful, so it stays.
+    from scripts.run_phase1 import step8_detect_events
 
     await asyncio.to_thread(step8_detect_events)
-    await asyncio.to_thread(step9_build_event_context)
