@@ -1,11 +1,18 @@
 """Deterministic two-level topic labelling for speech/document clusters.
 
 Maps a cluster's text to a readable **main headline** (broad theme) and a
-**secondary context** (sub-theme), using a curated keyword lexicon — the same
-rule-based, reproducible approach as `hawkish_lexicon`. Expand `THEMES` as new
-topics appear in the corpus.
+**secondary context** (sub-theme) using a curated keyword lexicon. The approach is
+rule-based and reproducible, like `hawkish_lexicon`. Expand `THEMES` as new topics
+appear in the corpus.
 
     main, secondary = classify(cluster_text, tfidf_terms)
+
+Keywords match as whole words, so "pow" does not match "Powell" and "opm" does not
+match "development". The words of a phrase may be separated by any whitespace,
+including line breaks, and the last word may carry a plural "s". A keyword ending in
+"*" also matches longer words that start with it, so "cyber*" matches "cybersecurity".
+A keyword written in capitals matches only in capitals, so "AIDS" does not match the
+verb "aids". Every occurrence of every keyword counts.
 """
 
 from __future__ import annotations
@@ -29,7 +36,8 @@ STOPWORDS = frozenset(
 )
 
 # main theme -> {sub-theme -> keyword set}. A cluster's score for a theme is the
-# total keyword hits across its sub-themes; the winning sub-theme is the secondary.
+# total keyword hits across its sub-themes. The sub-theme with the most hits is the
+# secondary.
 THEMES: dict[str, dict[str, set[str]]] = {
     "Monetary policy": {
         "Rate decisions": {
@@ -44,9 +52,9 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "bank rate",
         },
         "Inflation & prices": {
-            "inflation",
+            "inflation*",
             "price stability",
-            "disinflation",
+            "disinflation*",
             "consumer prices",
             "cpi",
         },
@@ -56,42 +64,42 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "unemployment",
             "economic outlook",
             "fomc",
-            "monetary policy",
+            "monetary policy*",
             "mpc",
         },
         "Financial stability": {
             "financial stability",
-            "systemic",
-            "stress test",
+            "systemic*",
+            "stress test*",
             "bank capital",
-            "prudential",
+            "prudential*",
             "macroprudential",
         },
     },
     "Sanctions & emergencies": {
-        "Iran": {"respect iran", "iran"},
-        "Russia & Ukraine": {"russia", "ukraine", "crimea"},
+        "Iran": {"respect iran", "iran*"},
+        "Russia & Ukraine": {"russia*", "ukraine", "crimea*"},
         "Counter-narcotics": {"narcotics", "traffickers", "drug trafficking"},
         "Asset blocking": {
             "blocked property",
             "interests property",
             "property interests",
             "national emergency",
-            "executive order 13",
+            "executive order 13*",
             "ofac",
             "sanction",
         },
         "Regional emergencies": {
-            "sudan",
+            "sudan*",
             "somalia",
-            "congo",
-            "zimbabwe",
+            "congo*",
+            "zimbabwe*",
             "balkans",
-            "libya",
-            "belarus",
-            "syria",
+            "libya*",
+            "belarus*",
+            "syria*",
             "lebanon",
-            "nicaragua",
+            "nicaragua*",
         },
     },
     "Trade & tariffs": {
@@ -99,7 +107,7 @@ THEMES: dict[str, dict[str, set[str]]] = {
         "Tariff schedule": {
             "tariff",
             "harmonized tariff",
-            " hts ",
+            "hts",
             "import duty",
             "section 301",
             "quota",
@@ -109,8 +117,8 @@ THEMES: dict[str, dict[str, set[str]]] = {
     },
     "Defense & security": {
         "Flags at half-staff": {"half staff", "flown half", "naval vessels", "shall flown"},
-        # NB: avoid bare "reserve"/"drawdown" — they collide with "Federal Reserve",
-        # "Reserve Bank", "bank reserves", and liquidity "drawdown" in CB speeches.
+        # Bare "reserve" and "drawdown" are left out because CB speeches use them in
+        # "Federal Reserve", "Reserve Bank", "bank reserves" and liquidity "drawdown".
         "Armed forces": {
             "armed forces",
             "national guard",
@@ -141,11 +149,11 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "observance",
             "recognition day",
             "hereby proclaim",
-            "proclaim",
+            "proclaim*",
             "prayer",
             "thanksgiving",
         },
-        "Remembrance": {"remembrance", "holocaust", "memorial"},
+        "Remembrance": {"remembrance", "holocaust", "memorial*"},
     },
     "Public health": {
         "Disease awareness": {
@@ -153,7 +161,7 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "prostate",
             "ovarian",
             "hiv",
-            "aids",
+            "AIDS",
             "alzheimer",
             "diabetes",
         },
@@ -172,7 +180,7 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "stalking",
             "race sex",
         },
-        "Education": {"charter schools", "hbcus", "apprenticeship", "apprenticeships"},
+        "Education": {"charter schools", "hbcus", "apprenticeship"},
     },
     "Immigration": {
         "Refugees & visas": {
@@ -194,7 +202,7 @@ THEMES: dict[str, dict[str, set[str]]] = {
             "data center",
         },
         "Cyber & intelligence": {
-            "cyber",
+            "cyber*",
             "signals intelligence",
             "spyware",
             "critical technology",
@@ -212,13 +220,27 @@ THEMES: dict[str, dict[str, set[str]]] = {
         "Delegation of authority": {
             "functions authorities",
             "authorities vested",
-            "delegate",
+            "delegate*",
             "succession",
             "order shall",
             "insofar",
         },
         "Civil service": {"competitive service", "probationary", "opm", "federal workforce"},
     },
+}
+
+
+def _pattern(keyword: str) -> re.Pattern[str]:
+    stem = keyword.endswith("*")
+    words = r"\s+".join(re.escape(w) for w in keyword.rstrip("*").split())
+    flags = 0 if keyword.isupper() else re.IGNORECASE
+    return re.compile(rf"\b{words}\w*" if stem else rf"\b{words}s?\b", flags)
+
+
+# THEMES with every keyword compiled once at import.
+_PATTERNS = {
+    main: {sub: [_pattern(k) for k in sorted(kws)] for sub, kws in subs.items()}
+    for main, subs in THEMES.items()
 }
 
 _TERM_SPLIT = re.compile(r"\s*/\s*|\s*,\s*")
@@ -240,24 +262,23 @@ def _clean_terms(tfidf_terms: str | list[str] | None) -> str:
 def classify(text: str, tfidf_terms: str | list[str] | None = None) -> tuple[str, str]:
     """Return (main_headline, secondary_context) for a cluster's text.
 
-    `text` is a representative sample of the cluster's documents; `tfidf_terms` is
+    `text` is a representative sample of the cluster's documents. `tfidf_terms` is
     the cluster's TF-IDF label, used as the secondary fallback when no sub-theme matches.
     """
-    t = " " + text.lower() + " "
     best_main, best_score, best_sub = "Other", 0, None
-    for main, subs in THEMES.items():
+    for main, subs in _PATTERNS.items():
         main_score = 0
         top_sub, top_hits = None, 0
-        for sub, kws in subs.items():
-            hits = sum(t.count(k) for k in kws)
+        for sub, patterns in subs.items():
+            hits = sum(len(p.findall(text)) for p in patterns)
             main_score += hits
             if hits > top_hits:
                 top_sub, top_hits = sub, hits
         if main_score > best_score:
             best_main, best_score, best_sub = main, main_score, top_sub
 
-    # A matched main always has a winning sub-theme (main_score is the sum of sub
-    # hits); only the "Other" path falls back to the cleaned TF-IDF terms.
+    # A matched main always has a winning sub-theme because main_score is the sum of
+    # the sub-theme hits. Only the "Other" path falls back to the cleaned TF-IDF terms.
     if best_main == "Other":
         return "Other", _clean_terms(tfidf_terms)
     return best_main, best_sub
