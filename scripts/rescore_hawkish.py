@@ -143,8 +143,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--snapshot-method",
-        default="lexicon_baseline",
-        help="tag for the baseline snapshot (default: lexicon_baseline)",
+        default="lexicon_v2",
+        help="tag for the baseline snapshot (default: lexicon_v2)",
     )
     args = parser.parse_args()
 
