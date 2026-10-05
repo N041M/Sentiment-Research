@@ -1,6 +1,8 @@
 """Tests for the deterministic two-level topic labeller (nlp/topic_lexicon)."""
 
-from sentiment_signal.nlp.topic_lexicon import _clean_terms, classify
+import pytest
+
+from sentiment_signal.nlp.topic_lexicon import THEMES, _clean_terms, classify
 
 
 def test_monetary_policy_main_and_sub():
@@ -98,3 +100,70 @@ def test_launch_facility_not_space():
     )
     main, _ = classify(text)
     assert main == "Monetary policy"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Chair Powell spoke to reporters.",  # "pow"
+        "Supply chains lost power for a week.",  # "pow"
+        "The minutes are kept in the archive.",  # "hiv"
+        "Economic development slowed.",  # "opm"
+        "Clear guidance aids market functioning.",  # "AIDS"
+        "The meeting was officially sanctioned.",  # "sanction"
+        "Prices kept increasing.",  # "easing"
+    ],
+)
+def test_keyword_does_not_match_unrelated_word(text):
+    assert classify(text)[0] == "Other"
+
+
+def test_powell_speech_is_monetary_policy():
+    # "pow" used to match "Powell" and "power" three times and outvote two monetary hits
+    text = "Chair Powell said inflation is easing. Powell expects power prices to fall."
+    assert classify(text)[0] == "Monetary policy"
+
+
+def test_aids_matches_only_in_capitals():
+    assert classify("World AIDS Day")[0] == "Public health"
+    assert classify("It aids recovery.")[0] == "Other"
+
+
+@pytest.mark.parametrize(
+    ("text", "main"),
+    [
+        ("New cybersecurity rules.", "Technology & cyber"),
+        ("Russian forces crossed the border.", "Sanctions & emergencies"),
+        ("Executive Order 13660 remains in effect.", "Sanctions & emergencies"),
+        ("Inflationary pressures persist.", "Monetary policy"),
+    ],
+)
+def test_starred_keyword_matches_longer_words(text, main):
+    assert classify(text)[0] == main
+
+
+def test_plural_matches():
+    assert classify("New tariffs on imports.")[0] == "Trade & tariffs"
+
+
+def test_phrase_matches_across_line_break():
+    assert classify("a rate\nhike")[0] == "Monetary policy"
+
+
+def test_hts_matches_next_to_punctuation():
+    # "hts" used to be padded with spaces, which missed "HTS," and "(HTS)"
+    assert classify("See heading 9903.88.15 of the HTS, as amended.")[0] == "Trade & tariffs"
+    assert classify("Human rights and insights.")[0] == "Other"
+
+
+def test_counts_every_occurrence():
+    # Three mentions of one keyword outweigh two different keywords.
+    assert classify("steel steel steel. inflation and cpi.")[0] == "Trade & tariffs"
+
+
+@pytest.mark.parametrize(
+    ("keyword", "main"),
+    [(k, main) for main, subs in THEMES.items() for kws in subs.values() for k in sorted(kws)],
+)
+def test_each_keyword_matches_its_own_theme(keyword, main):
+    assert classify(keyword.rstrip("*"))[0] == main
