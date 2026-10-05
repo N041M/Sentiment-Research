@@ -6,15 +6,18 @@ neutral (the live run labelled 80% of speeches neutral, mean score ~0). FOMC-RoB
 is a *sentence*-level classifier, so a single confidently-hawkish passage is buried
 when token-weighted-averaged against neutral filler.
 
-This scores each speech's 512-token chunks ONCE (cached to scratchpad), then applies
-several aggregation schemes to the cached per-chunk probabilities and reports the
-resulting stance distribution / spread / correlation with the lexicon baseline — to
-decide whether a non-mean aggregation recovers discrimination. Writes nothing to the
-DB; the lexicon baseline is read from the `hawkish_score_snapshot` table.
+This scores each speech's 512-token chunks once and caches the probabilities in the
+system temp directory. It then applies several aggregation schemes to the cached
+per-chunk probabilities and reports the stance distribution, the spread and the
+correlation with a lexicon baseline for each scheme. The purpose is to decide whether
+an aggregation other than the mean recovers discrimination. The script writes nothing
+to the DB. The lexicon baseline is read from the `hawkish_score_snapshot` rows tagged
+with `--baseline` (default `lexicon_v2`).
 
 Run from project root with venv active:
     python scripts/analyze_hawkish_aggregation.py
     python scripts/analyze_hawkish_aggregation.py --band 0.10 --recompute
+    python scripts/analyze_hawkish_aggregation.py --baseline lexicon_baseline
 """
 
 import argparse
@@ -131,6 +134,11 @@ def main() -> None:
     parser.add_argument(
         "--recompute", action="store_true", help="ignore the cache and re-run the model pass"
     )
+    parser.add_argument(
+        "--baseline",
+        default="lexicon_v2",
+        help="hawkish_score_snapshot tag of the lexicon baseline (default: lexicon_v2)",
+    )
     args = parser.parse_args()
 
     session = SessionLocal()
@@ -141,11 +149,15 @@ def main() -> None:
             for r in conn.execute(
                 text(
                     "SELECT statement_id::text, hawkish_score FROM hawkish_score_snapshot "
-                    "WHERE method = 'lexicon_baseline' AND hawkish_score IS NOT NULL"
-                )
+                    "WHERE method = :m AND hawkish_score IS NOT NULL"
+                ),
+                {"m": args.baseline},
             ).all()
         }
-        logger.info(f"Lexicon baseline: {len(baseline)} speeches")
+        if not baseline:
+            logger.error(f"No snapshot rows tagged '{args.baseline}'")
+            sys.exit(1)
+        logger.info(f"Lexicon baseline '{args.baseline}': {len(baseline)} speeches")
 
         speeches = [
             (str(r.id), r.raw_text)
@@ -168,9 +180,11 @@ def main() -> None:
         logger.info(f"Cached chunk probabilities to {CACHE.name} ({len(chunk_probs)} speeches)")
 
     logger.info(f"=== Aggregation comparison (neutral band ±{args.band}) ===")
-    logger.info("(higher std = more discrimination; lexicon baseline mean -0.198, std for ref)")
+    logger.info("A higher std means more discrimination. The lexicon row is the reference.")
     base_sc = np.array(list(baseline.values()))
-    logger.info(f"{'lexicon':16s} std={base_sc.std():.3f} mean={base_sc.mean():+.3f}  (reference)")
+    logger.info(
+        f"{args.baseline:16s} std={base_sc.std():.3f} mean={base_sc.mean():+.3f}  (reference)"
+    )
     for name, fn in SCHEMES.items():
         scores = {sid: fn(p, w) for sid, (p, w) in chunk_probs.items()}
         summarize(name, scores, baseline, args.band)
