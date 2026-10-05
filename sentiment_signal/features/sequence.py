@@ -32,6 +32,8 @@ class SentimentEvent:
     hawkish_score: float | None
     topic_main: str | None
     topic_id: int | None  # BERTopic topic / cluster_id; cheap "same topic" key
+    sentiment_label: str | None = None  # FinBERT argmax class (positive/neutral/negative)
+    hawkish_label: str | None = None  # FOMC-RoBERTa stance (hawkish/neutral/dovish); speech-only
 
 
 def _utc(ts: datetime) -> datetime:
@@ -94,6 +96,8 @@ def load_event_sequence(
             StatementAnalysis.hawkish_score,
             StatementAnalysis.topic_main,
             StatementAnalysis.cluster_id,
+            StatementAnalysis.sentiment_label,
+            StatementAnalysis.hawkish_label,
         )
         .join(Person, Person.id == Statement.person_id)
         .join(StatementAnalysis, StatementAnalysis.statement_id == Statement.id)
@@ -113,6 +117,8 @@ def load_event_sequence(
             hawkish_score=r[7],
             topic_main=r[8],
             topic_id=r[9],
+            sentiment_label=r[10],
+            hawkish_label=r[11],
         )
         for r in session.execute(query).all()
     ]
