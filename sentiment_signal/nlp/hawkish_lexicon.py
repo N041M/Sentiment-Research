@@ -8,13 +8,22 @@ hawkish_score = (hawkish_hits - dovish_hits) / (total_hits + SMOOTHING)
   < 0 → dovish  (accommodative / growth-supporting)
   = 0 → neutral or no signal
 
-The SMOOTHING term is deliberate: a plain (hawk - dove)/total normalisation maps any
-one-sided document to exactly ±1.0 — a single matched keyword scores the same as a
-strongly one-sided speech. Additive (Laplace) smoothing pulls thin evidence toward
-neutral, so the magnitude reflects evidence strength: 1 dovish hit → −0.33, 10 → −0.83.
+Without SMOOTHING, (hawk - dove) / total gives every one-sided document a score of
+exactly ±1.0, so a single matched keyword would score the same as a strongly
+one-sided speech. Additive (Laplace) smoothing pulls thin evidence toward neutral so
+that the magnitude reflects how much evidence there is. One dovish hit scores −0.33
+and ten score −0.83.
+
+Terms match as whole words, and the words of a phrase may be separated by any
+whitespace, including line breaks. The last word may also carry a plural "s", so
+"rate hike" matches "rate hikes". Every occurrence counts. A match that lies entirely
+inside a longer match is dropped, so "quantitative tightening" counts once and the
+"accommodative" inside "less accommodative" does not count as dovish.
 """
 
 from __future__ import annotations
+
+import re
 
 # Pseudo-counts of neutral evidence; regularises thin/one-sided matches toward 0.
 SMOOTHING = 2
@@ -31,9 +40,7 @@ HAWKISH = frozenset(
         "restrictive",
         "above neutral",
         "upside risk",
-        "upside risks",
         "inflation risk",
-        "inflation risks",
         "inflation expectations",
         "overheating",
         "overheat",
@@ -71,7 +78,6 @@ DOVISH = frozenset(
         "accommodative",
         "below neutral",
         "downside risk",
-        "downside risks",
         "recession risk",
         "unemployment",
         "labor market slack",
@@ -96,11 +102,42 @@ DOVISH = frozenset(
 )
 
 
+def _pattern(term: str) -> re.Pattern[str]:
+    words = r"\s+".join(re.escape(w) for w in term.split())
+    return re.compile(rf"\b{words}s?\b")
+
+
+# (pattern, is_hawkish) for every lexicon term, compiled once at import.
+_PATTERNS = [(_pattern(t), True) for t in sorted(HAWKISH)] + [
+    (_pattern(t), False) for t in sorted(DOVISH)
+]
+
+
+def _hits(text_lower: str) -> tuple[int, int]:
+    """Count hawkish and dovish matches, skipping any match inside a longer one."""
+    # Sorted by start, longest first, so a containing match is seen before its contents.
+    matches = sorted(
+        (m.start(), -m.end(), is_hawk)
+        for pattern, is_hawk in _PATTERNS
+        for m in pattern.finditer(text_lower)
+    )
+    hawk = dove = 0
+    reach = -1  # furthest end of any match kept so far
+    for _, neg_end, is_hawk in matches:
+        end = -neg_end
+        if end <= reach:
+            continue
+        reach = end
+        if is_hawk:
+            hawk += 1
+        else:
+            dove += 1
+    return hawk, dove
+
+
 def score(text: str) -> dict:
     """Return hawkish_score ∈ [-1, 1], label, and hit counts."""
-    text_lower = text.lower()
-    hawk_hits = sum(1 for term in HAWKISH if term in text_lower)
-    dove_hits = sum(1 for term in DOVISH if term in text_lower)
+    hawk_hits, dove_hits = _hits(text.lower())
     total = hawk_hits + dove_hits
     # Smoothed net tone in (-1, 1); never clamps to ±1 on thin one-sided evidence.
     raw_score = (hawk_hits - dove_hits) / (total + SMOOTHING)
